@@ -1,0 +1,6 @@
+gcloud kms encrypt --project nth-bucksaw-328005 --location us-central1 --keyring my-key-ring --key my-crypto-key --plaintext-file --ciphertext-file -> | base64
+
+gcloud kms encrypt --key=my-crypto-key --keyring=my-key-ring --location=us-central1 --plaintext-file=plaintext --ciphertext-file=ciphertext
+value=`cat ciphertext |base64`
+rm ciphertext
+echo $value
