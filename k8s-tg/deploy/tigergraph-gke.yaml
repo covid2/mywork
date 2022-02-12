@@ -1,0 +1,304 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  labels:
+    app: tigergraph
+  name: gcp-pd-ssd
+  namespace: default
+parameters:
+  type: pd-ssd
+provisioner: kubernetes.io/gce-pd
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+data:
+  cluster_size: "1"
+  ha: "1"
+  license: ""
+  namespace: default
+  pod.prefix: tigergraph
+  service.headless.name: tigergraph
+kind: ConfigMap
+metadata:
+  labels:
+    app: tigergraph
+  name: env-config
+  namespace: default
+---
+apiVersion: v1
+data:
+  init_tg_cfg: |-
+    System.HostList=[{"ID":"m1","Hostname":"127.0.0.1","Region":""}]
+    System.SSH.User.Username=tigergraph
+    System.SSH.User.Password=tigergraph
+    System.SSH.User.Privatekey=/home/tigergraph/.ssh/tigergraph_rsa
+    System.DataRoot=/home/tigergraph/tigergraph/data
+    System.LogRoot=/home/tigergraph/tigergraph/log
+    System.TempRoot=/tmp
+kind: ConfigMap
+metadata:
+  labels:
+    app: tigergraph
+  name: tg-config
+  namespace: default
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: tigergraph
+  name: tg-external-service
+  namespace: default
+spec:
+  ports:
+  - name: rest
+    port: 9000
+    targetPort: 9000
+  - name: graphstudio
+    port: 14240
+    targetPort: 14240
+  selector:
+    app: tigergraph
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: tigergraph
+  name: tigergraph
+  namespace: default
+spec:
+  clusterIP: None
+  ports:
+  - name: rest
+    port: 9000
+    targetPort: 9000
+  - name: graphstudio
+    port: 14240
+    targetPort: 14240
+  selector:
+    app: tigergraph
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: tigergraph
+  name: tigergraph
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tigergraph
+  serviceName: tigergraph
+  template:
+    metadata:
+      labels:
+        app: tigergraph
+    spec:
+      containers:
+      - env:
+        - name: SERVICE_NAME
+          valueFrom:
+            configMapKeyRef:
+              key: service.headless.name
+              name: env-config
+        - name: POD_PREFIX
+          valueFrom:
+            configMapKeyRef:
+              key: pod.prefix
+              name: env-config
+        - name: NAMESPACE
+          valueFrom:
+            configMapKeyRef:
+              key: namespace
+              name: env-config
+        - name: CLUSTER_SIZE
+          valueFrom:
+            configMapKeyRef:
+              key: cluster_size
+              name: env-config
+        image: docker.tigergraph.com/tigergraph-k8s:latest
+        imagePullPolicy: IfNotPresent
+        lifecycle:
+          postStart:
+            exec:
+              command:
+              - /bin/bash
+              - -c
+              - |
+                (
+                  if [ "$(ls -A /home/tigergraph/tigergraph/data/|grep -v lost|tail -1)" ]; then
+                    for i in $(seq 1 ${CLUSTER_SIZE});
+                    do
+                      until nslookup ${POD_PREFIX}-$((i-1)).${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local;
+                      do
+                        echo "wait dns to be updated";
+                        sleep 1;
+                      done;
+                    done;
+                    sleep 15;
+                    export PATH=/home/tigergraph/tigergraph/app/cmd:$PATH
+                    ln -sf /home/tigergraph/tigergraph/data/configs/tg.cfg /home/tigergraph/.tg.cfg
+                    grun all "hostname"
+                    echo "starting service at $(date)"
+                    gadmin start all --with-config /home/tigergraph/.tg.cfg;
+                  else
+                    sudo chown -R tigergraph:tigergraph /home/tigergraph/tigergraph/data;
+                  fi
+                ) > /tmp/init.log 2>&1 &
+                disown -a
+                exit 0
+                "
+        name: tigergraph
+        ports:
+        - containerPort: 9000
+          name: rest
+        - containerPort: 14240
+          name: graphstudio
+        - containerPort: 22
+          name: ssh
+        resources:
+          requests:
+            cpu: 100m
+            memory: 2Gi
+        volumeMounts:
+        - mountPath: /home/tigergraph/tigergraph/data
+          name: tg-data
+        - mountPath: /tmp/init_tg_cfg
+          name: config-volume
+          subPath: init_tg_cfg
+      imagePullSecrets:
+      - name: regcred
+      volumes:
+      - configMap:
+          items:
+          - key: init_tg_cfg
+            path: init_tg_cfg
+          name: tg-config
+        name: config-volume
+  volumeClaimTemplates:
+  - metadata:
+      labels:
+        app: tigergraph
+      name: tg-data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 50Gi
+      storageClassName: gcp-pd-ssd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  labels:
+    app: tigergraph
+  name: installer
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: tigergraph
+    spec:
+      containers:
+      - command:
+        - /bin/sh
+        - -c
+        - |
+          set -e;
+          apk update && apk add sshpass openssh jq;
+          export SSHPASS='tigergraph';
+          sshpass -e ssh -o StrictHostKeyChecking=no tigergraph@${POD_PREFIX}-0.${SERVICE_NAME}.${NAMESPACE} "
+            if [[ \$(ls -A /home/tigergraph/tigergraph/data/|grep -v lost|tail -1) ]]; then
+              echo 'found lagacy data, skip installation'
+            else
+              export PATH=/home/tigergraph/tigergraph/app/cmd:$PATH;
+              tg_cfg=\$(find /home/tigergraph/tigergraph/app/ -name .tg.cfg|head -n 1);
+              ln -sf \$tg_cfg .tg.cfg;
+              cp /tmp/init_tg_cfg /tmp/tg_cfg;
+              sed -i 's/\=/\: /g' /tmp/tg_cfg;
+              echo >> /tmp/tg_cfg;
+              jq -j '.System | \"System.AppRoot: \",.AppRoot' \$tg_cfg >> /tmp/tg_cfg;
+              echo >> /tmp/tg_cfg;
+              if [[ -z \"$LICENSE\" ]]; then
+                jq -j '.System | \"System.License: \",.License' \$tg_cfg >> /tmp/tg_cfg;
+              else
+                echo \"System.License: ${LICENSE}\" >> /tmp/tg_cfg;
+              fi;
+              gadmin config init -i /tmp/tg_cfg --file /tmp/tg.cfg --ha ${HA};
+              cp --remove-destination /tmp/tg.cfg ~/.tg.cfg;
+              gadmin init cluster -y --skip-stop;
+            fi
+          ";
+        env:
+        - name: LICENSE
+          valueFrom:
+            configMapKeyRef:
+              key: license
+              name: env-config
+        - name: HA
+          valueFrom:
+            configMapKeyRef:
+              key: ha
+              name: env-config
+        - name: SERVICE_NAME
+          valueFrom:
+            configMapKeyRef:
+              key: service.headless.name
+              name: env-config
+        - name: POD_PREFIX
+          valueFrom:
+            configMapKeyRef:
+              key: pod.prefix
+              name: env-config
+        - name: NAMESPACE
+          valueFrom:
+            configMapKeyRef:
+              key: namespace
+              name: env-config
+        image: alpine:latest
+        name: cluster-installer
+      initContainers:
+      - command:
+        - /bin/sh
+        - -c
+        - |
+          set -e; for i in $(seq 1 ${CLUSTER_SIZE}); do
+
+            until nslookup ${POD_PREFIX}-$((i-1)).${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local;
+            do
+              echo waiting for tigergraph;
+              sleep 1;
+            done;
+          done; sleep 15;
+        env:
+        - name: SERVICE_NAME
+          valueFrom:
+            configMapKeyRef:
+              key: service.headless.name
+              name: env-config
+        - name: POD_PREFIX
+          valueFrom:
+            configMapKeyRef:
+              key: pod.prefix
+              name: env-config
+        - name: NAMESPACE
+          valueFrom:
+            configMapKeyRef:
+              key: namespace
+              name: env-config
+        - name: CLUSTER_SIZE
+          valueFrom:
+            configMapKeyRef:
+              key: cluster_size
+              name: env-config
+        image: alpine:latest
+        name: init-tigergraph
+      restartPolicy: OnFailure
+  ttlSecondsAfterFinished: 60
