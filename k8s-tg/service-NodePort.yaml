@@ -14,5 +14,5 @@ spec:
     name: rest
     targetPort: 9000
   - port: 14240
-    name: graphstudio
+    name: graphstudio-6
     targetPort: 14240
